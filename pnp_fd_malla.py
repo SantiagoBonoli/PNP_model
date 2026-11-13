@@ -149,6 +149,16 @@ class Malla:
             raise ValueError("Rres debe ser mayor que Rtip y Rbase.")
         if modo_carga not in ("superficial", "vol_z", "vol_radial", "vol_combinado"):
             raise ValueError("modo_carga invalido.")
+        if modo_carga not in ("superficial"):
+            def _tramo(zz, nombre):
+                a, b = max(float(zz[0]), 0.0), min(float(zz[1]), float(L))
+                if not b > a:
+                    raise ValueError(f"{nombre} debe cumplir 0 <= a < b <= L.")
+                return (a, b)
+
+            if z_vol is not None:
+                z_vol = _tramo(z_vol, "z_vol")
+        
         if modo_carga in ("vol_z", "vol_combinado") and z_vol is None:
             raise ValueError(f"modo '{modo_carga}' requiere z_vol=(za, zb).")
         if modo_carga in ("vol_radial", "vol_combinado") and (S_vol is None or S_vol <= 0):
