@@ -234,10 +234,10 @@ def mapa(V, zmin=-100.0, zmax=100.0, r_max=100.0):
 
         rho = np.where(
             m.zc < 0.0,
-            m.Rtip,
+            m.Rres,
             np.where(
                 m.zc > m.L,
-                m.Rbase,
+                m.Rres,
                 m.perfil(m.zc)
             )
         )
