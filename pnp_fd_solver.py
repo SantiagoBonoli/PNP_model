@@ -18,15 +18,16 @@ BLOQUES (bloques Nr x Nr). Se resuelven con eliminacion de bloques (Thomas) usan
 xp.linalg.solve (cuSOLVER en GPU). El ensamblado, los flujos, los residuos y el mixing de
 Anderson son operaciones vectorizadas sobre arreglos del dispositivo (CuPy).
 """
-import time
 import numpy as np
+import scipy.sparse as sp
+import scipy.sparse.linalg as spla
 import pnp_fd_malla as MM
-from pnp_fd_malla import (_xp, _cpu, _dev, F, R_GAS, T, VT, C0, ELL2, SIGHAT, D0, D_P, D_M,
-                          SIGNO_I, Malla)
+from pnp_fd_malla import (_xp, _cpu, _dev, F, VT, C0, ELL2, SIGHAT, D0, D_P, D_M,
+                          SIGNO_I)
 
-DMAX = 3.0            # tope del paso de potencial por iteracion (unidades V_T)
+DMAX = 1.0            # tope del paso de potencial por iteracion (unidades V_T)
 CMIN = 1e-30
-FMIN, FMAX = 0.05, 20.0   # cambio relativo maximo de c por iteracion
+FMIN, FMAX = 0.01, 20.0   # cambio relativo maximo de c por iteracion
 N_POISSON = 12        # pasos internos maximos del Poisson no lineal (convexo)
 
 
@@ -108,29 +109,6 @@ def _div(Fz, Fr):
 
 
 # ----------------------------- residuos -----------------------------
-def residuos(m, st, Vhat, fs=1.0, fX=1.0):
-    """Residuos conservativos completos (Poisson, c+, c-) por celda, mas una escala local
-    (suma de |flujos|) para medir el error relativo."""
-    xp, g = _xp(), m.g
-    phi, cp_, cm_ = st
-    sigh, sigm = m.sigma * SIGHAT * fs, m.sigma_membrana * SIGHAT
-    Fz, Fr = _flujos_phi(m, phi, Vhat)
-    RP = (-_div(Fz, Fr) + sigh * g["Asig"] + sigm * g["Amem"]
-          + g["V"] * (cp_ - cm_ + fX * g["Xfix"]) / ELL2)
-    sP = xp.abs(Fz[1:]) + xp.abs(Fz[:-1])
-    sP[:, :-1] += xp.abs(Fr)
-    sP[:, 1:] += xp.abs(Fr)
-    out = [xp.where(g["act"], RP, 0.0), sP + g["V"] * (cp_ + cm_) / ELL2]
-    for c, zs, D in ((cp_, 1.0, D_P), (cm_, -1.0, D_M)):
-        Fz, Fr = _flujos(m, c, phi, zs, D, Vhat)
-        R = _div(Fz, Fr)
-        s = xp.abs(Fz[1:]) + xp.abs(Fz[:-1])
-        s[:, :-1] += xp.abs(Fr)
-        s[:, 1:] += xp.abs(Fr)
-        out += [xp.where(g["act"], R, 0.0), s]
-    return out
-
-
 def residuos_poisson(m, phi, cp_, cm_, Vhat, fs=1.0, fX=1.0):
     """Residuo de Poisson por celda y su escala local (para medir el error relativo)."""
     xp, g = _xp(), m.g
@@ -171,6 +149,22 @@ def _thomas(d, lo, up, zl, zu, b):
     return x
 
 
+# "auto": LU dispersa (SuperLU, orden COLAMD) en CPU y Thomas por bloques en GPU.
+# "thomas" / "sparse" fuerzan uno u otro.
+SOLVER_LINEAL = "auto"
+
+
+def _splu_5pt(d, lo, up, zl, zu, b):
+    """Mismo sistema de 5 puntos que _thomas, con LU dispersa (CPU)."""
+    Nz, Nr = d.shape
+    lo, up = lo.copy(), up.copy()
+    lo[:, 0] = 0.0
+    up[:, -1] = 0.0
+    A = sp.diags([d.ravel(), up.ravel()[:-1], lo.ravel()[1:], zu.ravel()[:-Nr], zl.ravel()[Nr:]],
+                 [0, 1, -1, Nr, -Nr], format="csc")
+    return spla.splu(A).solve(b.ravel()).reshape(Nz, Nr)
+
+
 def _resolver_5pt(m, d, lo, up, zl, zu, b):
     xp, act = _xp(), m.g["act"]
     d = xp.where(act, d, 1.0)
@@ -179,7 +173,13 @@ def _resolver_5pt(m, d, lo, up, zl, zu, b):
     sc = xp.maximum(xp.maximum(xp.abs(d), xp.abs(lo)), xp.maximum(xp.abs(up),
                     xp.maximum(xp.abs(zl), xp.abs(zu))))
     sc = 1.0 / sc
-    return _thomas(d * sc, lo * sc, up * sc, zl * sc, zu * sc, b * sc)
+    args = (d * sc, lo * sc, up * sc, zl * sc, zu * sc, b * sc)
+    if SOLVER_LINEAL == "sparse" or (SOLVER_LINEAL == "auto" and not MM.USAR_GPU):
+        try:
+            return _splu_5pt(*args)
+        except RuntimeError:                       # matriz singular -> mismo manejo que Thomas
+            raise np.linalg.LinAlgError("LU dispersa singular")
+    return _thomas(*args)
 
 
 # ----------------------------- ensamblado -----------------------------
@@ -290,7 +290,7 @@ def _unpack(m, x):
 
 
 def anderson_gummel(m, st, Vhat, fs=1.0, fX=1.0, tol=1e-9, maxit=300, mem=8, beta=1.0,
-                    verbose=False):
+                    verbose=True):
     """Punto fijo x = G(x) con Anderson(mem). Devuelve (estado, ok, iteraciones, ||dx||inf)."""
     xp = _xp()
     x = _pack(m, st)
@@ -342,7 +342,7 @@ def estado_inicial(m):
     return (xp.zeros(m.act.shape), xp.ones(m.act.shape), xp.ones(m.act.shape))
 
 
-def resolver(m, V_volt, sigma, st0=None, tol=1e-9, maxit=300, mem=8, verbose=False,
+def resolver(m, V_volt, sigma, st0=None, tol=1e-9, maxit=300, mem=8, verbose=True,
              fcontinuacion0=0.1):
     """Estado en V_volt (derecho; izquierdo a tierra). Sin estado previo, hace continuacion
     adaptativa en la carga (superficial + volumetrica + membrana) a V=0."""
@@ -385,8 +385,15 @@ def corriente(m, st, Vhat):
     return float(I[m.k0:m.kL + 1].mean()), I
 
 
+def error_conservacion(m, I):
+    """Desviacion relativa de la corriente entre las caras del poro (std/|media|).
+    Deberia ser ~1e-6 o menor; si no, el promedio del poro esconde un problema de malla."""
+    Ip = np.asarray(I)[m.k0:m.kL + 1]
+    return float(Ip.std() / max(abs(Ip.mean()), 1e-300))
+
+
 def curva_IV(m, V_list, sigma, verbose=True, dV_max=0.1, tol=1e-9, maxit=300, mem=8,
-             verbose_iter=False):
+             verbose_iter=True):
     """Curva I-V con continuacion en V (pasos <= dV_max). I(V) - I(0) como en el modelo previo."""
     V_list = np.asarray(V_list, float)
     st0, ok = resolver(m, 0.0, sigma, tol=tol, maxit=maxit, mem=mem, verbose=verbose_iter)

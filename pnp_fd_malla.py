@@ -71,7 +71,7 @@ KAPPA_OBJETIVO = 1.29                   # S/m, KCl 0.1 M a 25 C
 KAPPA_NE = F**2 * C0 * (D_K + D_CL) / (R_GAS * T)
 FACT_D = KAPPA_OBJETIVO / KAPPA_NE
 D0 = D_K * FACT_D
-D_P = 1.0
+D_P = 1
 D_M = D_CL / D_K
 ELL2 = EPS * R_GAS * T / (F**2 * C0) * 1e18   # nm2; lambda_D^2 = ELL2/2
 SIGHAT = F / (EPS * R_GAS * T) * 1e-9         # (C/m2) -> (1/nm)
@@ -124,9 +124,10 @@ def _gauss_cells(za, zb, f):
 class Malla:
     def __init__(
         self, Rtip, Rbase, L_h, L=12000.0, Rres=25000.0, Lres=None,
+        N = 1,
         # --- axial ---
         h_boca=None,          # celda junto a la boca (a ambos lados del plano) (nm)
-        q_z=1.15,             # crecimiento axial por celda
+        q_z=1.10,             # crecimiento axial por celda
         alpha_poro=0.5,       # celda axial <= alpha_poro * rho(z) en el poro
         h_max_poro=None,      # tope de celda axial en el poro (nm)
         h_borde=None,         # celda en bordes de zonas cargadas (nm)
@@ -135,7 +136,7 @@ class Malla:
         dw_pared=None,        # celda de pared a la MAYOR radio del poro (nm); None -> 0.3*lambda_D
         q_xi=1.15,            # crecimiento radial desde la pared (en xi)
         dxi_max=0.1,          # tope de celda en xi
-        q_r=1.25,             # crecimiento radial del reservorio fuera de la boca
+        q_r=1.10,             # crecimiento radial del reservorio fuera de la boca
         refinar=2.0,          # divide TODOS los tamanos de celda (estudio de convergencia)
         # --- carga ---
         modo_carga="superficial",   # "superficial" | "vol_z" | "vol_radial" | "vol_combinado"
@@ -157,8 +158,8 @@ class Malla:
                 return (a, b)
 
             if z_vol is not None:
-                z_vol = _tramo(z_vol, "z_vol")
-        
+                z_vol = _tramo(z_vol, "z_vol")        
+
         if modo_carga in ("vol_z", "vol_combinado") and z_vol is None:
             raise ValueError(f"modo '{modo_carga}' requiere z_vol=(za, zb).")
         if modo_carga in ("vol_radial", "vol_combinado") and (S_vol is None or S_vol <= 0):
@@ -173,6 +174,7 @@ class Malla:
         self.sigma_membrana = float(sigma_membrana)
         Rmin, Rmax = min(Rtip, Rbase), max(Rtip, Rbase)
         lamD = np.sqrt(ELL2 / 2.0)
+        self.N = float(N)
 
         # ---------- zonas volumetricas ----------
         def _tramo(zz):
@@ -384,16 +386,23 @@ class Malla:
         if abs(self.L_h) < 1e-8:
             gg = x
         else:
-            gg = (1.0 - np.exp(-self.L_h * x)) / (1.0 - np.exp(-self.L_h))
+            gg = (1.0 - np.exp(-(self.L_h * x)**self.N)) / (1.0 - np.exp(-self.L_h**self.N))
         return self.Rtip + (self.Rbase - self.Rtip) * gg
 
     def dperfil(self, z):
         z = np.asarray(z, float)
         x = np.clip(z / self.L, 0.0, 1.0)
+
         if abs(self.L_h) < 1e-8:
             dg = np.ones_like(x) / self.L
         else:
-            dg = self.L_h * np.exp(-self.L_h * x) / (1.0 - np.exp(-self.L_h)) / self.L
+            dg = (
+                self.N * self.L_h**self.N * x**(self.N - 1)
+                * np.exp(-(self.L_h * x)**self.N)
+                / (1.0 - np.exp(-self.L_h**self.N))
+                / self.L
+            )
+
         return (self.Rbase - self.Rtip) * dg
 
     # ---------- operadores precomputados (en el dispositivo) ----------
