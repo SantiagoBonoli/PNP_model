@@ -14,18 +14,18 @@ import numpy as np
 import matplotlib.pyplot as plt
 import pnp_fd_malla as P          # malla FD axisimetrica (poro + reservorios)
 import pnp_fd_solver as S         # solver Gummel + Anderson
-
+from matplotlib.ticker import MaxNLocator
 # ============================ parametros (nm, C/m2) ============================
 E_CHARGE = 1.602176634e-19                  # C
 
-R_TIP, R_BASE, L_H, L = 7.5, 250.0, 6.0, 12000.0    # nm (L/h del perfil "bullet")
-SIGMA = -1.0 * E_CHARGE * 1e18              # carga de pared: -1 e/nm2 en C/m2
+R_TIP, R_BASE, L_H, L = 5.0, 5.0, 1.0, 50.0    # nm (L/h del perfil "bullet")
+SIGMA = -0.1 * E_CHARGE * 1e18              # carga de pared: -1 e/nm2 en C/m2
 SIGMA_MEMBRANA = 0.0                        # C/m2 en las caras planas de la membrana (z=0, z=L; r>R)
 
 V_LIST = np.linspace(-1.0, 1.0, 21)         # V = phi(base) - phi(punta)
 DV_MAX = 0.05                               # paso maximo de continuacion en V (baja solo si no converge)
 
-R_RES = 30.0 * R_BASE                       # radio de los reservorios (nm)
+R_RES = 1000                       # radio de los reservorios (nm)
 L_RES = R_RES                               # largo de cada reservorio (nm)
 REFINAR = 2.0                               # divide TODOS los tamanos de celda de la malla
 
@@ -45,8 +45,9 @@ MALLA = dict(
 )
 
 ARCHIVO_DATOS = "resultado_pnp_reservorios.pkl"
+ARCHIVO_IV = "curva_IV.csv" 
 FORZAR_RECALCULO = False
-TOL, MAXIT, MEM = 1e-9, 300, 8              # parametros del solver (entran en la firma)
+TOL, MAXIT, MEM = 1e-9, 500, 8              # parametros del solver (entran en la firma)
 
 # ============================ malla ============================
 P.usar_gpu(True)
@@ -77,7 +78,7 @@ def cargar_cache():
         datos = pickle.load(f)
     if datos.get("firma") != FIRMA:
         print(f"--- '{ARCHIVO_DATOS}' es de otros parametros: se recalcula ---")
-        return None
+        #return None
     print(f"--- Resultados cargados de '{ARCHIVO_DATOS}' ---")
     return datos
 
@@ -100,8 +101,15 @@ I_nA, sol = datos["I_A"] * 1e9, datos["sol"]
 def corriente_en(V):
     return I_nA[int(np.argmin(np.abs(V_LIST - V)))]
  
- 
+np.savetxt(ARCHIVO_IV, np.column_stack((V_LIST, I_nA)), delimiter=",",
+           fmt=("%.4f", "%.9e"), header="V (V),I (nA)", comments="")
+print(f"Tabla V-I guardada: {ARCHIVO_IV}")
+print("      V (V)      I (nA)")
+for v_, i_ in zip(V_LIST, I_nA):
+    print(f"   {v_:+8.3f}  {i_:+12.5f}")
+
 I_neg, I_pos = corriente_en(-1.0), corriente_en(1.0)
+print(I_neg, I_pos)
 rect = abs(I_neg / I_pos) if np.isfinite(I_neg) and abs(I_pos) > 1e-14 else np.nan
 print(f"Rectificacion |I(-1 V)/I(1 V)| = {rect:.6g}")
 
@@ -115,7 +123,7 @@ fig, ax = plt.subplots(figsize=(5.5, 4.5))
 ax.plot(V_LIST, I_nA, "o-", label="PNP 2D axisimetrico con reservorios")
 ax.axhline(0.0, color="k", lw=0.6)
 ax.axvline(0.0, color="k", lw=0.6)
-ax.set(xlabel=r"V = $\phi_{base} - \phi_{punta}$ (V)", ylabel="I (nA)")
+ax.set(xlabel=r"$\Delta V$ (V)", ylabel="I (nA)")
 ax.legend()
 ax.grid(alpha=0.3)
 fig.tight_layout()
@@ -123,17 +131,22 @@ fig.savefig("iv_2d_reservorios.png", dpi=200)
  
 
 def mapa(V,
-         zmin_zoom=-15.0, zmax_zoom=15.0, rmax_zoom=15.0,
+         zmin_zoom=-2.5, zmax_zoom=2.5, rmax_zoom=6.0,
          zmin_poro=-R_BASE, zmax_poro=L + R_BASE, rmax_poro=1.5 * R_BASE,
          reservorios=True,
-         cmax_fijo=None):
+         cmax_fijo=1.5,
+         paso_cbar_c=0.25,
+         levels=100):
     """
     Mapas 2D de phi, c+ y c- (espejados respecto de r = 0). Una figura por voltaje.
 
     Filas: (1) zoom de la punta, (2) poro con una boca de reservorio a cada lado,
            (3) [si reservorios=True] dominio completo, con ambos electrodos.
-    Escala de c+/c-: de 0 al maximo visible en cada panel (o hasta cmax_fijo si se
-    pasa), para no saturar el contraion dentro del poro. phi: automatica.
+    Concentraciones: escala de 0 a vmax, con marcas de la barra de colores cada
+    `paso_cbar_c` (0.25). Por defecto (cmax_fijo=None) vmax es el maximo visible en cada
+    panel, asi el contraion dentro del poro no se satura; con cmax_fijo=<valor> la escala
+    es comun y lo que la supere se satura (flecha en la barra).
+    phi: escala automatica, con marcas "redondas" (0.2, 0.4, ...).
     """
     if len(sol) == 0:
         raise ValueError("No hay soluciones disponibles en sol.")
@@ -143,14 +156,14 @@ def mapa(V,
     # 1. Variables (siempre a CPU)
     estado = sol[V_sol]
     phi = np.asarray(P._cpu(estado[0])) * P.VT
+    print(P.VT)
     cp = np.asarray(P._cpu(estado[1]))
     cm = np.asarray(P._cpu(estado[2]))
     U = np.stack((phi, cp, cm), axis=-1)
 
-    # 2. Esquinas de celda (Nzc+1, Nr+1): z en las caras, r = promedio de m.rm entre columnas
-    rm_car = np.empty((m.Nzc + 1, m.Nr + 1))
-    rm_car[1:-1] = 0.5 * (m.rm[1:] + m.rm[:-1])
-    rm_car[0], rm_car[-1] = m.rm[0], m.rm[-1]
+    # 2. Coordenadas fisicas
+    Z = np.broadcast_to(m.zc[:, None], (m.Nzc, m.Nr))
+    R = m.rc
 
     # 3. Perfil geometrico. En los reservorios se dibuja la pared exterior (Rres); el
     #    salto Rres -> perfil en z=0 / z=L traza la cara plana de la membrana.
@@ -176,10 +189,8 @@ def mapa(V,
         if np.count_nonzero(sel) < 2:
             raise ValueError(f"Ventana {nombre_fila} con nodos insuficientes.")
 
-        Us, acts, rhos = U[sel], m.act[sel], rho[sel]
-        i0 = int(np.flatnonzero(sel)[0])
-        i1 = int(np.flatnonzero(sel)[-1]) + 1
-        zcar, rcar = m.zf[i0:i1 + 1], rm_car[i0:i1 + 1]
+        Zs, Rs, Us = Z[sel, :], R[sel, :], U[sel, :, :]
+        acts, rhos = m.act[sel, :], rho[sel]
 
         for col, (titulo, k, es_conc) in enumerate(campos):
             ax = axs[fila, col]
@@ -188,23 +199,35 @@ def mapa(V,
             if valores.size == 0:
                 continue
 
-            if es_conc:
-                vmin_c = 0.0
-                vmax_c = float(valores.max()) if cmax_fijo is None else float(cmax_fijo)
-                vmax_c = max(vmax_c, 1.0)
+            if titulo == r"$\phi$ (V)":
+                if V_sol>0:
+                    vmin_c = 0.0
+                    vmax_c = 0.5
+                else:
+                    vmax_c = 0.0
+                    vmin_c = -0.5   
+                extend = "both"
             else:
-                vmin_c, vmax_c = float(valores.min()), float(valores.max())
-                if np.isclose(vmin_c, vmax_c):
-                    vmax_c = vmin_c + 1e-10
+                if es_conc:
+                    vmin_c = 0.0
+                    vmax_c = float(valores.max()) if cmax_fijo is None else float(cmax_fijo)
+                    vmax_c = max(vmax_c, paso_cbar_c)
+                    extend = "max"
+                else:
+                    vmin_c, vmax_c = float(valores.min()), float(valores.max())
+                    if np.isclose(vmin_c, vmax_c):
+                        vmax_c = vmin_c + 1e-10
+                    extend = "neither"
 
-            # Espejo respecto de r = 0, con esquinas EXACTAS de celda (z: caras zf; r: caras rm
-            # promediadas entre columnas vecinas), asi pcolormesh no interpola entre celdas.
-            Zc = np.repeat(zcar[:, None], 2 * m.Nr + 1, axis=1)
-            Rc = np.concatenate((-rcar[:, :0:-1], rcar), axis=1)
+            niveles = np.linspace(vmin_c, vmax_c, levels)
+
+            # Espejo respecto de r = 0
+            Zfull = np.concatenate((Zs[:, ::-1], Zs), axis=1)
+            Rfull = np.concatenate((-Rs[:, ::-1], Rs), axis=1)
             Cfull = np.ma.concatenate((C[:, ::-1], C), axis=1)
 
-            cf = ax.pcolormesh(Zc, Rc, Cfull, shading="flat", cmap="viridis",
-                               vmin=vmin_c, vmax=vmax_c, rasterized=True)
+            cf = ax.contourf(Zfull, Rfull, Cfull, levels=niveles,
+                             cmap="magma", extend=extend)
 
             ax.plot(m.zc[sel], rhos, "k", lw=1.3)
             ax.plot(m.zc[sel], -rhos, "k", lw=1.3)
@@ -213,13 +236,20 @@ def mapa(V,
 
             ax.set_xlim(zlo, zhi)
             ax.set_ylim(-rmax, rmax)
-            ax.set_xlabel("z - z_punta (nm)")
+            ax.set_xlabel("z (nm)")
             if fila == 0:
                 ax.set_title(titulo, fontsize=13)
             if col == 0:
                 ax.set_ylabel(f"{nombre_fila}\nr (nm)")
 
             cb = fig.colorbar(cf, ax=ax, fraction=0.046, pad=0.035)
+            if es_conc:
+                # marcas cada paso_cbar_c (0.25), de 0 a vmax
+                cb.set_ticks(np.arange(0.0, vmax_c + 1e-9, paso_cbar_c))
+                cb.ax.yaxis.set_major_formatter(plt.FormatStrFormatter("%.2f"))
+            else:
+                cb.locator = MaxNLocator(nbins=8, steps=[1, 2, 2.5, 5, 10])
+                cb.update_ticks()
             cb.ax.tick_params(labelsize=8)
 
     fig.suptitle(f"Distribucion de potencial y concentraciones | V = {V_sol:+.2f} V",
@@ -228,14 +258,14 @@ def mapa(V,
 
     nombre = (f"mapas_punta_V{V_sol:+.2f}_{len(ventanas)}x3.png"
               .replace("+", "p").replace("-", "m"))
-    fig.savefig(nombre, dpi=200, bbox_inches="tight")
+    fig.savefig(nombre, dpi=300, bbox_inches="tight")
     print(f"Mapa guardado: {nombre}")
     return fig, axs
 
 
 # 5. Generar mapas para cada voltaje
 figuras = {}
-for V in (-1.0, 0.0, 1.0):
+for V in (-0.5, 0.0, 0.5):
     figuras[V] = mapa(V)
 
 plt.show()
