@@ -52,7 +52,7 @@ E_CHARGE = 1.602176634e-19
 VT = R_GAS * T / F
 EPS = 78.5 * 8.8541878128e-12
 C0 = 100.0                              # mol/m3 = 0.1 M
-D_K, D_CL = 1.957e-9, 2.032e-9
+D_K, D_CL = 2e-9, 2e-9
 KAPPA_NE = F**2 * C0 * (D_K + D_CL) / (R_GAS * T)
 KAPPA_OBJETIVO = KAPPA_NE               # S/m, consistente con Nernst-Einstein / COMSOL (~1.4981 S/m)
 FACT_D = KAPPA_OBJETIVO / KAPPA_NE

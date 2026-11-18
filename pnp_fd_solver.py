@@ -13,10 +13,17 @@ SIN NEWTON. Se resuelve con una iteracion de tipo GUMMEL acelerada por ANDERSON:
   Anderson(m) minimiza en minimos cuadrados el residuo G(x)-x sobre las ultimas m iteraciones
   (acelera el punto fijo y elimina el estancamiento tipico de Gummel).
 
-Sistemas lineales: matrices de 5 puntos ordenadas por columnas z => TRIDIAGONALES POR
-BLOQUES (bloques Nr x Nr). Se resuelven con eliminacion de bloques (Thomas) usando
-xp.linalg.solve (cuSOLVER en GPU). El ensamblado, los flujos, los residuos y el mixing de
-Anderson son operaciones vectorizadas sobre arreglos del dispositivo (CuPy).
+Sistemas lineales: matrices de 5 puntos sobre las celdas ACTIVAS (las celdas de membrana
+se descartan: ~2x menos filas). El patron CSR es fijo para cada malla y se construye una
+sola vez. Backends (SOLVER_LINEAL):
+  "cudss"  : GPU. cuDSS (nvmath-python) con analisis simbolico UNA vez por malla y solo
+             refactorizacion + solve en cada paso; los datos nunca salen de la GPU.
+  "sparse" : LU dispersa (SuperLU) en CPU. En modo GPU solo se transfieren los ~5 arreglos
+             comprimidos (unos MB) y el resultado vuelve a la GPU.
+  "thomas" : eliminacion de bloques densa (legado; muy lenta en GPU por ser secuencial).
+  "auto"   : GPU -> cudss si esta disponible (si falla, cae a sparse); CPU -> sparse.
+El ensamblado, los flujos, los residuos y el mixing de Anderson son operaciones
+vectorizadas sobre arreglos del dispositivo (CuPy).
 """
 import numpy as np
 import scipy.sparse as sp
@@ -149,13 +156,12 @@ def _thomas(d, lo, up, zl, zu, b):
     return x
 
 
-# "auto": LU dispersa (SuperLU, orden COLAMD) en CPU y Thomas por bloques en GPU.
-# "thomas" / "sparse" fuerzan uno u otro.
-SOLVER_LINEAL = "auto"
+SOLVER_LINEAL = "auto"      # "auto" | "cudss" | "sparse" | "thomas"
+CHEQUEO_CUDSS = 1e-7        # residuo relativo maximo aceptado en la 1a resolucion con cuDSS
 
 
 def _splu_5pt(d, lo, up, zl, zu, b):
-    """Mismo sistema de 5 puntos que _thomas, con LU dispersa (CPU)."""
+    """(Legado) Sistema de 5 puntos completo con LU dispersa en CPU."""
     Nz, Nr = d.shape
     lo, up = lo.copy(), up.copy()
     lo[:, 0] = 0.0
@@ -165,21 +171,141 @@ def _splu_5pt(d, lo, up, zl, zu, b):
     return spla.splu(A).solve(b.ravel()).reshape(Nz, Nr)
 
 
-def _resolver_5pt(m, d, lo, up, zl, zu, b):
-    xp, act = _xp(), m.g["act"]
-    d = xp.where(act, d, 1.0)
-    lo, up, zl, zu = (xp.where(act, a, 0.0) for a in (lo, up, zl, zu))
-    b = xp.where(act, b, 0.0)
-    sc = xp.maximum(xp.maximum(xp.abs(d), xp.abs(lo)), xp.maximum(xp.abs(up),
-                    xp.maximum(xp.abs(zl), xp.abs(zu))))
-    sc = 1.0 / sc
-    args = (d * sc, lo * sc, up * sc, zl * sc, zu * sc, b * sc)
-    if SOLVER_LINEAL == "sparse" or (SOLVER_LINEAL == "auto" and not MM.USAR_GPU):
+class _Sistema5:
+    """Patron CSR fijo del sistema de 5 puntos restringido a las celdas activas.
+    Orden de las 5 diagonales por fila: (i-1,j), (i,j-1), (i,j), (i,j+1), (i+1,j), que es
+    el de columnas crecientes. Se construye una vez por malla."""
+
+    def __init__(self, m):
+        act = np.asarray(_cpu(m.g["act"]))
+        Nz, Nr = act.shape
+        flat = np.flatnonzero(act.ravel())
+        n = flat.size
+        comp = -np.ones(Nz * Nr, np.int64)
+        comp[flat] = np.arange(n)
+        i, j = np.divmod(flat, Nr)
+        vec = np.stack([flat - Nr, flat - 1, flat, flat + 1, flat + Nr], axis=1)
+        ok = np.stack([i > 0, j > 0, np.ones(n, bool), j < Nr - 1, i < Nz - 1], axis=1)
+        vc = np.where(ok, comp[np.clip(vec, 0, Nz * Nr - 1)], -1)
+        mask = vc >= 0
+        self.shape, self.n = (Nz, Nr), n
+        self.indices = vc[mask].astype(np.int32)
+        self.indptr = np.concatenate([[0], np.cumsum(mask.sum(1))]).astype(np.int32)
+        self.flat_d = _dev(flat)
+        self.mask2d_d = _dev(mask)
+        self.mask_d = _dev(mask.ravel())
+        self.indices_d = _dev(self.indices)
+        self.indptr_d = _dev(self.indptr)
+        self.cudss = None            # estado de cuDSS (se crea al primer uso)
+        self.backend = None          # backend efectivo ("cudss" / "sparse")
+
+
+def _sistema(m):
+    s = getattr(m, "_sis5", None)
+    if s is None:
+        s = m._sis5 = _Sistema5(m)
+    return s
+
+
+def _cudss_disponible():
+    if not MM.USAR_GPU:
+        return False
+    try:
+        import cupyx.scipy.sparse  # noqa: F401
+        from nvmath.sparse.advanced import DirectSolver  # noqa: F401
+        return True
+    except Exception:
+        return False
+
+
+def _backend(sis):
+    if SOLVER_LINEAL in ("sparse", "thomas"):
+        return SOLVER_LINEAL
+    if sis.backend is None:                    # "auto" o "cudss" (con caida a sparse si falla)
+        sis.backend = "cudss" if _cudss_disponible() else "sparse"
+        print(f"--- Solver lineal: {sis.backend} ({sis.n} incognitas por sistema) ---", flush=True)
+    return sis.backend
+
+
+def liberar_solvers(m):
+    """Libera el estado de cuDSS asociado a la malla (opcional)."""
+    sis = getattr(m, "_sis5", None)
+    if sis is not None and sis.cudss is not None:
         try:
-            return _splu_5pt(*args)
-        except RuntimeError:                       # matriz singular -> mismo manejo que Thomas
-            raise np.linalg.LinAlgError("LU dispersa singular")
-    return _thomas(*args)
+            sis.cudss.free()
+        except Exception:
+            pass
+        sis.cudss = None
+
+
+def _solve_cudss(sis, data, b):
+    import cupy as cpx
+    import cupyx.scipy.sparse as csp
+    from nvmath.sparse.advanced import DirectSolver
+    A = csp.csr_matrix((data, sis.indices_d, sis.indptr_d), shape=(sis.n, sis.n))
+    if sis.cudss is None:
+        sis.cudss = DirectSolver(A, b)
+        sis.cudss.plan()                       # reordenamiento + simbolico: UNA vez
+    else:
+        sis.cudss.reset_operands(a=A, b=b)     # mismo patron, nuevos valores
+    sis.cudss.factorize()
+    x = cpx.array(sis.cudss.solve(), copy=True)
+    return A, x
+
+
+def _solve_sparse(sis, data, b):
+    A = sp.csr_matrix((_cpu(data), sis.indices, sis.indptr), shape=(sis.n, sis.n)).tocsc()
+    try:
+        # matrices estructuralmente simetricas y diagonalmente dominantes: orden MMD(A+A^T)
+        # y pivoteo casi diagonal (~1.7x mas rapido que COLAMD, mismo resultado a 1e-15)
+        x = spla.splu(A, permc_spec="MMD_AT_PLUS_A", diag_pivot_thresh=0.01,
+                      options=dict(SymmetricMode=True)).solve(_cpu(b))
+    except RuntimeError:
+        raise np.linalg.LinAlgError("LU dispersa singular")
+    return _dev(x)
+
+
+def _resolver_5pt(m, d, lo, up, zl, zu, b):
+    """Resuelve el sistema de 5 puntos (d diag; lo/up j-1,j+1; zl/zu i-1,i+1) en las celdas
+    activas. Devuelve x (Nzc, Nr) con 0 en las celdas inactivas."""
+    xp = _xp()
+    sis = _sistema(m)
+    modo = _backend(sis)
+    if modo == "thomas":
+        act = m.g["act"]
+        d = xp.where(act, d, 1.0)
+        lo, up, zl, zu = (xp.where(act, a, 0.0) for a in (lo, up, zl, zu))
+        b = xp.where(act, b, 0.0)
+        sc = 1.0 / xp.maximum(xp.maximum(xp.abs(d), xp.abs(lo)), xp.maximum(xp.abs(up),
+                              xp.maximum(xp.abs(zl), xp.abs(zu))))
+        return _thomas(d * sc, lo * sc, up * sc, zl * sc, zu * sc, b * sc)
+
+    vals = xp.stack([zl, lo, d, up, zu], axis=-1).reshape(-1, 5)[sis.flat_d]
+    vals = xp.where(sis.mask2d_d, vals, 0.0)
+    sc = 1.0 / xp.max(xp.abs(vals), axis=1)                 # equilibrado por filas
+    data = (vals * sc[:, None]).ravel()[sis.mask_d]
+    bc = b.ravel()[sis.flat_d] * sc
+
+    xc = None
+    if modo == "cudss":
+        try:
+            A, xc = _solve_cudss(sis, data, bc)
+            if not getattr(sis, "_chequeado", False):          # verificacion de la 1a resolucion
+                res = float(xp.linalg.norm(A.dot(xc) - bc) / max(float(xp.linalg.norm(bc)), 1e-300))
+                if not res < CHEQUEO_CUDSS:
+                    raise RuntimeError(f"residuo relativo {res:.2e} de cuDSS")
+                sis._chequeado = True
+        except Exception as e:
+            print(f"!! cuDSS no disponible o inexacto ({type(e).__name__}: {e}); "
+                  f"se usa LU dispersa en CPU", flush=True)
+            liberar_solvers(m)
+            sis.backend = "sparse"
+            xc = None
+    if xc is None:
+        xc = _solve_sparse(sis, data, bc)
+    x = xp.zeros(sis.shape[0] * sis.shape[1])
+    x[sis.flat_d] = xc
+    return x.reshape(sis.shape)
 
 
 # ----------------------------- ensamblado -----------------------------
@@ -248,9 +374,9 @@ def _poisson_boltzmann(m, st, Vhat, fs, fX):
         c1, c2 = xp.where(act, c1, 1.0), xp.where(act, c2, 1.0)
         RP, sP = residuos_poisson(m, cur, c1, c2, Vhat, fs, fX)
         delta = _resolver_5pt(m, *_matriz_poisson(m, c1, c2), RP)
-        dm = float(xp.max(xp.abs(delta)))
+        dm, n0 = (float(v) for v in _cpu(xp.stack([xp.max(xp.abs(delta)),
+                                                   xp.max(xp.abs(RP) / sP)])))   # 1 sincronizacion
         om = min(1.0, DMAX / max(dm, 1e-300))
-        n0 = float(xp.max(xp.abs(RP) / sP))
         for _ in range(8):
             new = cur + om * delta
             d1, d2 = xp.exp(u_p - new), xp.exp(new - u_n)
